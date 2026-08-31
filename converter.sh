@@ -11,9 +11,11 @@
 #     instead of a cryptic arithmetic error later
 #   - Works with ImageMagick 6 (`convert`) or 7 (`magick`) — original only checked `magick`
 #   - Fallback compression pass now respects `-w` instead of a hardcoded 900px
-#   - `-o` accepts .jpg/.jpeg/.pdf; if you ask for .pdf, the compressed image is
-#     wrapped into a real, valid single-page PDF instead of just being renamed
-#     (previously a .pdf output was actually raw JPEG bytes and wouldn't open)
+#   - `-o` accepts .jpg/.jpeg/.pdf, and now the two behave properly differently:
+#       .jpg/.jpeg -> all pages flattened into ONE stacked image (as before)
+#       .pdf       -> a REAL multi-page PDF, one page per input page, in order
+#                     (previously .pdf output was just a single flattened
+#                     image mislabeled/wrapped as a 1-page PDF)
 #   - All error/log output goes to stderr consistently
 set -euo pipefail
 IFS=$'\n\t'
@@ -42,17 +44,23 @@ usage() {
   cat <<EOF
 Usage: $0 [options] <file1> [file2 ...]
 
-Merges one or more PDFs/images (all pages of each PDF, in order) into a
-single image, then compresses it to fit under a target file size.
+Accepts PDFs, JPGs, and PNGs (any mix, any count) and produces ONE output
+file, compressed to fit under a target size:
+
+  -o out.jpg / out.jpeg  -> every page from every input is stacked into
+                            ONE flattened image (direction set by -m),
+                            then compressed as a single JPEG.
+  -o out.pdf             -> every page is kept as its own page, in the
+                            same order as given, compressed and assembled
+                            into a single real multi-page PDF. (-m is
+                            ignored here — nothing is being stacked.)
 
 Options:
   -o FILE    Output filename: .jpg/.jpeg or .pdf (default: $OUT)
-             A .pdf output is a real, valid PDF (the compressed JPEG wrapped
-             into a single-page PDF) — not just a renamed JPEG.
-  -s KB      Target max size in KB (default: $TARGET_KB)
-  -d DPI     DPI for PDF render (default: $DPI)
+  -s KB      Target max size in KB for the WHOLE output file (default: $TARGET_KB)
+  -d DPI     DPI for PDF page rendering (default: $DPI)
   -w WIDTH   Max width in pixels during compression attempts (default: $WIDTH)
-  -m MODE    Merge mode: vertical (default) or horizontal
+  -m MODE    Merge mode for image output only: vertical (default) or horizontal
   -p RANGE   PDF page range: "all" (default), a single page "2", or a range "1-3"
              Applies to every PDF given; images are unaffected.
   -g         Also try a grayscale fallback pass if size target isn't met
@@ -60,11 +68,12 @@ Options:
   -h         Show this help
 
 Examples:
-  $0 sem1.pdf                            # compress a single PDF (all its pages, stacked)
-  $0 -m horizontal a.pdf b.jpg           # combine side-by-side
-  $0 -o result.jpg -s 80 f.png           # produce <=80KB output
-  $0 -p 1-3 -s 200 scan.pdf              # only pages 1-3 of scan.pdf, <=200KB
-  $0 page1.jpg page2.jpg page3.jpg       # merge several page images into one file
+  $0 sem1.pdf                            # compress a single PDF (all its pages, stacked into 1 JPEG)
+  $0 -o merged.pdf a.pdf b.pdf           # merge two PDFs into one multi-page PDF, <=100KB
+  $0 -m horizontal a.pdf b.jpg           # combine side-by-side into one JPEG
+  $0 -o result.jpg -s 80 f.png           # produce <=80KB JPEG output
+  $0 -p 1-3 -o pages.pdf -s 200 scan.pdf # only pages 1-3 of scan.pdf, as a PDF, <=200KB
+  $0 page1.jpg page2.jpg -o combo.pdf    # turn separate page images into one 2-page PDF
 EOF
 }
 
@@ -80,6 +89,7 @@ is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
 # fail the "file not found" check). This loop lets flags and files appear in
 # any order, e.g. `converter.sh file1.pdf -o out.jpg file2.pdf` also works.
 # ---------------------------------------------------------------------------
+MERGE_MODE_EXPLICIT=0
 POSITIONAL=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -90,7 +100,7 @@ while [ $# -gt 0 ]; do
     -m)
        [ $# -ge 2 ] || die "-m requires an argument"
        [[ "$2" =~ ^(vertical|horizontal)$ ]] || die "-m must be 'vertical' or 'horizontal'"
-       MERGE_MODE="$2"; shift 2
+       MERGE_MODE="$2"; MERGE_MODE_EXPLICIT=1; shift 2
        ;;
     -p) [ $# -ge 2 ] || die "-p requires an argument"; PAGE_RANGE="$2"; shift 2 ;;
     -g) GRAYSCALE_FALLBACK=1; shift ;;
@@ -125,7 +135,7 @@ fi
 OUT_EXT="${OUT##*.}"; OUT_EXT="${OUT_EXT,,}"
 case "$OUT_EXT" in
   jpg|jpeg|pdf) ;;
-  *) die "-o must end in .jpg, .jpeg, or .pdf (got '$OUT') — this tool always compresses to JPEG internally; use .pdf if you want that JPEG wrapped back into a real, openable PDF." ;;
+  *) die "-o must end in .jpg, .jpeg, or .pdf (got '$OUT') — use .jpg/.jpeg for a single flattened compressed image, or .pdf for a real multi-page PDF with pages kept separate." ;;
 esac
 
 MAX_BYTES=$(( TARGET_KB * 1024 ))
@@ -203,73 +213,140 @@ done
 log "Rendered ${#PAGE_PNGS[@]} page(s) from ${#INPUT_FILES[@]} input file(s)."
 
 # ---------------------------------------------------------------------------
-# Merge all pages into a single image
+# From here the two output types genuinely diverge:
+#
+#   .jpg/.jpeg -> all pages are stacked (vertical/horizontal, per -m) into
+#                 ONE flattened image, then compressed. (unchanged behavior)
+#
+#   .pdf       -> each page stays its own PDF page, in the original order.
+#                 Every page is compressed uniformly (same JPEG quality/width
+#                 for all pages at a given attempt) so the whole document fits
+#                 the size target, then assembled into one multi-page PDF.
+#                 -m (merge direction) doesn't apply here, since nothing is
+#                 being stacked into a single image.
 # ---------------------------------------------------------------------------
-combined="$tmpdir/combined.png"
-if [ "${#PAGE_PNGS[@]}" -eq 1 ]; then
-  cp "${PAGE_PNGS[0]}" "$combined"
-else
-  append_flag="-append"
-  [ "$MERGE_MODE" = "horizontal" ] && append_flag="+append"
-  IM "${PAGE_PNGS[@]}" $append_flag "$combined"
-fi
-log "Combined image ready ($MERGE_MODE merge)."
 
-# ---------------------------------------------------------------------------
-# Compression: step down JPEG quality until under the size target.
-# We always compress to a JPEG working file first (jpeg_out); if the user
-# asked for a .pdf output, we wrap that JPEG into a real, valid single-page
-# PDF at the very end (finalize_output), so the result actually opens as
-# whatever file type its extension claims.
-# ---------------------------------------------------------------------------
-jpeg_out="$tmpdir/output.jpg"
-final_tmp="$tmpdir/final_tmp.jpg"
-success=0
-
-for q in "${QUALITY_STEPS[@]}"; do
-  IM "$combined" -strip -interlace Plane -sampling-factor 4:2:0 \
-     -quality "$q" -resize "${WIDTH}x" "$final_tmp"
-
-  size=$(stat -c%s "$final_tmp")
-  log "  quality=$q -> $((size/1024)) KB"
-  if [ "$size" -le "$MAX_BYTES" ]; then
-    mv "$final_tmp" "$jpeg_out"
-    log "Compressed to $((size/1024)) KB at quality=$q"
-    success=1
-    break
-  fi
-done
-
-if [ "$success" -ne 1 ]; then
-  log "Target not reached with normal quality steps; trying fallback reductions..."
-  fallback_width=$(( WIDTH < 900 ? WIDTH : 900 ))
-
-  if [ "$GRAYSCALE_FALLBACK" -eq 1 ]; then
-    IM "$combined" -colorspace Gray -strip -interlace Plane -sampling-factor 4:2:0 \
-       -quality "$FALLBACK_QUALITY" -resize "${fallback_width}x" "$final_tmp"
-  else
-    IM "$combined" -strip -interlace Plane -sampling-factor 4:2:0 \
-       -quality "$FALLBACK_QUALITY" -resize "${fallback_width}x" "$final_tmp"
-  fi
-
-  if [ "$JPEGOPTIM_AVAILABLE" -eq 1 ]; then
-    jpegoptim --size="${TARGET_KB}k" --strip-all "$final_tmp" >/dev/null 2>&1 || true
-  fi
-
-  size=$(stat -c%s "$final_tmp")
-  mv "$final_tmp" "$jpeg_out"
-  log "Fallback compression -> $((size/1024)) KB"
+if [ "$OUT_EXT" = "pdf" ] && [ "$MERGE_MODE_EXPLICIT" -eq 1 ]; then
+  log "Note: -m is ignored for PDF output — every page is kept separate."
 fi
 
-# ---------------------------------------------------------------------------
-# Finalize: write out in the format the user actually asked for
-# ---------------------------------------------------------------------------
 if [ "$OUT_EXT" = "pdf" ]; then
-  IM "$jpeg_out" "$OUT" || die "failed to wrap compressed image into a PDF."
+  # -------------------------------------------------------------------------
+  # PDF output: compress every page at the same quality/width per attempt,
+  # assemble into a multi-page PDF, and check the *total* PDF size.
+  # -------------------------------------------------------------------------
+  npages="${#PAGE_PNGS[@]}"
+  success=0
+
+  compress_pages_to() {
+    # compress_pages_to <quality> <width> <grayscale:0|1> <dest_dir> -> fills PAGE_JPGS
+    local q="$1" w="$2" gray="$3" dest="$4"
+    PAGE_JPGS=()
+    local idx=0 png pj
+    for png in "${PAGE_PNGS[@]}"; do
+      idx=$((idx+1))
+      pj="$dest/page_${idx}.jpg"
+      if [ "$gray" -eq 1 ]; then
+        IM "$png" -colorspace Gray -strip -interlace Plane -sampling-factor 4:2:0 \
+           -quality "$q" -resize "${w}x" "$pj"
+      else
+        IM "$png" -strip -interlace Plane -sampling-factor 4:2:0 \
+           -quality "$q" -resize "${w}x" "$pj"
+      fi
+      PAGE_JPGS+=("$pj")
+    done
+  }
+
+  for q in "${QUALITY_STEPS[@]}"; do
+    attempt_dir="$tmpdir/attempt_q${q}"; mkdir -p "$attempt_dir"
+    compress_pages_to "$q" "$WIDTH" 0 "$attempt_dir"
+    candidate="$attempt_dir/candidate.pdf"
+    IM "${PAGE_JPGS[@]}" "$candidate"
+
+    size=$(stat -c%s "$candidate")
+    log "  quality=$q -> $((size/1024)) KB ($npages page(s))"
+    if [ "$size" -le "$MAX_BYTES" ]; then
+      mv "$candidate" "$OUT"
+      log "Compressed to $((size/1024)) KB at quality=$q"
+      success=1
+      break
+    fi
+  done
+
+  if [ "$success" -ne 1 ]; then
+    log "Target not reached with normal quality steps; trying fallback reductions..."
+    fallback_width=$(( WIDTH < 900 ? WIDTH : 900 ))
+    fallback_dir="$tmpdir/attempt_fallback"; mkdir -p "$fallback_dir"
+    compress_pages_to "$FALLBACK_QUALITY" "$fallback_width" "$GRAYSCALE_FALLBACK" "$fallback_dir"
+
+    if [ "$JPEGOPTIM_AVAILABLE" -eq 1 ]; then
+      per_page_kb=$(( TARGET_KB / npages ))
+      [ "$per_page_kb" -lt 1 ] && per_page_kb=1
+      jpegoptim --size="${per_page_kb}k" --strip-all "${PAGE_JPGS[@]}" >/dev/null 2>&1 || true
+    fi
+
+    IM "${PAGE_JPGS[@]}" "$OUT"
+    size=$(stat -c%s "$OUT")
+    log "Fallback compression -> $((size/1024)) KB"
+  fi
+
 else
-  mv "$jpeg_out" "$OUT"
+  # -------------------------------------------------------------------------
+  # Image output: stack every page into one flattened image (as before),
+  # then step down JPEG quality until it's under the size target.
+  # -------------------------------------------------------------------------
+  combined="$tmpdir/combined.png"
+  if [ "${#PAGE_PNGS[@]}" -eq 1 ]; then
+    cp "${PAGE_PNGS[0]}" "$combined"
+  else
+    append_flag="-append"
+    [ "$MERGE_MODE" = "horizontal" ] && append_flag="+append"
+    IM "${PAGE_PNGS[@]}" $append_flag "$combined"
+  fi
+  log "Combined image ready ($MERGE_MODE merge)."
+
+  final_tmp="$tmpdir/final_tmp.jpg"
+  success=0
+
+  for q in "${QUALITY_STEPS[@]}"; do
+    IM "$combined" -strip -interlace Plane -sampling-factor 4:2:0 \
+       -quality "$q" -resize "${WIDTH}x" "$final_tmp"
+
+    size=$(stat -c%s "$final_tmp")
+    log "  quality=$q -> $((size/1024)) KB"
+    if [ "$size" -le "$MAX_BYTES" ]; then
+      mv "$final_tmp" "$OUT"
+      log "Compressed to $((size/1024)) KB at quality=$q"
+      success=1
+      break
+    fi
+  done
+
+  if [ "$success" -ne 1 ]; then
+    log "Target not reached with normal quality steps; trying fallback reductions..."
+    fallback_width=$(( WIDTH < 900 ? WIDTH : 900 ))
+
+    if [ "$GRAYSCALE_FALLBACK" -eq 1 ]; then
+      IM "$combined" -colorspace Gray -strip -interlace Plane -sampling-factor 4:2:0 \
+         -quality "$FALLBACK_QUALITY" -resize "${fallback_width}x" "$final_tmp"
+    else
+      IM "$combined" -strip -interlace Plane -sampling-factor 4:2:0 \
+         -quality "$FALLBACK_QUALITY" -resize "${fallback_width}x" "$final_tmp"
+    fi
+
+    if [ "$JPEGOPTIM_AVAILABLE" -eq 1 ]; then
+      jpegoptim --size="${TARGET_KB}k" --strip-all "$final_tmp" >/dev/null 2>&1 || true
+    fi
+
+    size=$(stat -c%s "$final_tmp")
+    mv "$final_tmp" "$OUT"
+    log "Fallback compression -> $((size/1024)) KB"
+  fi
 fi
 
+# ---------------------------------------------------------------------------
+# Final size check
+# ---------------------------------------------------------------------------
 final_size=$(stat -c%s "$OUT")
 log "Wrote '$OUT' ($((final_size/1024)) KB)"
 if [ "$final_size" -gt "$MAX_BYTES" ]; then
