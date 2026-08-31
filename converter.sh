@@ -11,6 +11,9 @@
 #     instead of a cryptic arithmetic error later
 #   - Works with ImageMagick 6 (`convert`) or 7 (`magick`) — original only checked `magick`
 #   - Fallback compression pass now respects `-w` instead of a hardcoded 900px
+#   - `-o` accepts .jpg/.jpeg/.pdf; if you ask for .pdf, the compressed image is
+#     wrapped into a real, valid single-page PDF instead of just being renamed
+#     (previously a .pdf output was actually raw JPEG bytes and wouldn't open)
 #   - All error/log output goes to stderr consistently
 set -euo pipefail
 IFS=$'\n\t'
@@ -43,7 +46,9 @@ Merges one or more PDFs/images (all pages of each PDF, in order) into a
 single image, then compresses it to fit under a target file size.
 
 Options:
-  -o FILE    Output filename (default: $OUT)
+  -o FILE    Output filename: .jpg/.jpeg or .pdf (default: $OUT)
+             A .pdf output is a real, valid PDF (the compressed JPEG wrapped
+             into a single-page PDF) — not just a renamed JPEG.
   -s KB      Target max size in KB (default: $TARGET_KB)
   -d DPI     DPI for PDF render (default: $DPI)
   -w WIDTH   Max width in pixels during compression attempts (default: $WIDTH)
@@ -67,26 +72,36 @@ is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
 # ---------------------------------------------------------------------------
 # Argument parsing
+#
+# NOTE: this is a hand-rolled loop rather than `getopts` on purpose. Bash's
+# getopts stops treating things as flags the moment it sees the first
+# non-flag argument, so `converter.sh file1.pdf file2.pdf -o out.jpg` would
+# leave "-o" and "out.jpg" as unparsed positional args (and "-o" would then
+# fail the "file not found" check). This loop lets flags and files appear in
+# any order, e.g. `converter.sh file1.pdf -o out.jpg file2.pdf` also works.
 # ---------------------------------------------------------------------------
-while getopts ":o:s:d:w:m:p:gfh" opt; do
-  case $opt in
-    o) OUT="$OPTARG" ;;
-    s) TARGET_KB="$OPTARG" ;;
-    d) DPI="$OPTARG" ;;
-    w) WIDTH="$OPTARG" ;;
-    m)
-       [[ "$OPTARG" =~ ^(vertical|horizontal)$ ]] || die "-m must be 'vertical' or 'horizontal'"
-       MERGE_MODE="$OPTARG"
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) [ $# -ge 2 ] || die "-o requires an argument"; OUT="$2"; shift 2 ;;
+    -s) [ $# -ge 2 ] || die "-s requires an argument"; TARGET_KB="$2"; shift 2 ;;
+    -d) [ $# -ge 2 ] || die "-d requires an argument"; DPI="$2"; shift 2 ;;
+    -w) [ $# -ge 2 ] || die "-w requires an argument"; WIDTH="$2"; shift 2 ;;
+    -m)
+       [ $# -ge 2 ] || die "-m requires an argument"
+       [[ "$2" =~ ^(vertical|horizontal)$ ]] || die "-m must be 'vertical' or 'horizontal'"
+       MERGE_MODE="$2"; shift 2
        ;;
-    p) PAGE_RANGE="$OPTARG" ;;
-    g) GRAYSCALE_FALLBACK=1 ;;
-    f) FORCE=1 ;;
-    h) usage; exit 0 ;;
-    \?) die "invalid option -$OPTARG (see -h)" ;;
-    :)  die "option -$OPTARG requires an argument" ;;
+    -p) [ $# -ge 2 ] || die "-p requires an argument"; PAGE_RANGE="$2"; shift 2 ;;
+    -g) GRAYSCALE_FALLBACK=1; shift ;;
+    -f) FORCE=1; shift ;;
+    -h) usage; exit 0 ;;
+    --) shift; while [ $# -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
+    -*) die "invalid option '$1' (see -h)" ;;
+    *) POSITIONAL+=("$1"); shift ;;
   esac
 done
-shift $((OPTIND-1))
+set -- "${POSITIONAL[@]}"
 
 [ $# -ge 1 ] || { usage; exit 1; }
 
@@ -106,6 +121,12 @@ done
 if [ -f "$OUT" ] && [ "$FORCE" -ne 1 ]; then
   die "output '$OUT' exists. Use -f to overwrite."
 fi
+
+OUT_EXT="${OUT##*.}"; OUT_EXT="${OUT_EXT,,}"
+case "$OUT_EXT" in
+  jpg|jpeg|pdf) ;;
+  *) die "-o must end in .jpg, .jpeg, or .pdf (got '$OUT') — this tool always compresses to JPEG internally; use .pdf if you want that JPEG wrapped back into a real, openable PDF." ;;
+esac
 
 MAX_BYTES=$(( TARGET_KB * 1024 ))
 
@@ -195,8 +216,13 @@ fi
 log "Combined image ready ($MERGE_MODE merge)."
 
 # ---------------------------------------------------------------------------
-# Compression: step down JPEG quality until under the size target
+# Compression: step down JPEG quality until under the size target.
+# We always compress to a JPEG working file first (jpeg_out); if the user
+# asked for a .pdf output, we wrap that JPEG into a real, valid single-page
+# PDF at the very end (finalize_output), so the result actually opens as
+# whatever file type its extension claims.
 # ---------------------------------------------------------------------------
+jpeg_out="$tmpdir/output.jpg"
 final_tmp="$tmpdir/final_tmp.jpg"
 success=0
 
@@ -207,8 +233,8 @@ for q in "${QUALITY_STEPS[@]}"; do
   size=$(stat -c%s "$final_tmp")
   log "  quality=$q -> $((size/1024)) KB"
   if [ "$size" -le "$MAX_BYTES" ]; then
-    mv "$final_tmp" "$OUT"
-    log "Success: wrote '$OUT' ($((size/1024)) KB) at quality=$q"
+    mv "$final_tmp" "$jpeg_out"
+    log "Compressed to $((size/1024)) KB at quality=$q"
     success=1
     break
   fi
@@ -231,12 +257,24 @@ if [ "$success" -ne 1 ]; then
   fi
 
   size=$(stat -c%s "$final_tmp")
-  mv "$final_tmp" "$OUT"
-  log "Fallback output: '$OUT' -> $((size/1024)) KB"
-  if [ "$size" -gt "$MAX_BYTES" ]; then
-    log "Warning: still above target (${TARGET_KB} KB). Try lowering -d (DPI) or -w (WIDTH), narrowing -p (page range), or adding -g for grayscale."
-    exit 2
-  fi
+  mv "$final_tmp" "$jpeg_out"
+  log "Fallback compression -> $((size/1024)) KB"
+fi
+
+# ---------------------------------------------------------------------------
+# Finalize: write out in the format the user actually asked for
+# ---------------------------------------------------------------------------
+if [ "$OUT_EXT" = "pdf" ]; then
+  IM "$jpeg_out" "$OUT" || die "failed to wrap compressed image into a PDF."
+else
+  mv "$jpeg_out" "$OUT"
+fi
+
+final_size=$(stat -c%s "$OUT")
+log "Wrote '$OUT' ($((final_size/1024)) KB)"
+if [ "$final_size" -gt "$MAX_BYTES" ]; then
+  log "Warning: still above target (${TARGET_KB} KB). Try lowering -d (DPI) or -w (WIDTH), narrowing -p (page range), or adding -g for grayscale."
+  exit 2
 fi
 
 exit 0
