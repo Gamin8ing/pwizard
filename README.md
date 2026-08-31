@@ -107,26 +107,5 @@ sudo cp converter.sh /usr/local/bin/converter
    anyway and prints a warning with suggestions (lower `-d`/`-w`, narrow
    `-p`, or add `-g`).
 
-## Notes / fixed issues from earlier version
-
-This version fixes a few bugs from an earlier draft that's worth knowing
-about if you're upgrading:
-
-- `-h` now exits with status `0` instead of `1`.
-- Only the **first page** of a PDF used to be rendered — every other page
-  was silently dropped. All pages (or your chosen `-p` range) are now
-  rendered.
-- The tool was hard-limited to exactly one or two input files. It now
-  accepts any number.
-- `-s`/`-d`/`-w` values are validated as positive integers up front, instead
-  of failing later with a confusing arithmetic error.
-- Works with ImageMagick 6 (`convert`) as well as 7 (`magick`).
-- The fallback compression pass now respects your `-w` width setting instead
-  of a hardcoded `900px`.
-
-## Exit codes
-
-- `0` — success, output written under the target size
-- `1` — bad arguments, missing dependency, or missing input file
-- `2` — output was written but is still above the target size after all
-  fallbacks (check the warning message for suggestions)
+## Contribution
+Open for contribution for more features or bug fixes. Please raise a PR if you feel so. 
